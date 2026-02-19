@@ -10,3 +10,4 @@ dist/
 .env
 .venv/
 venv/
+usage_history.json

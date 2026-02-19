@@ -7,23 +7,22 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import csv
+import json
+import math
 import os
 import sys
-import io
-from datetime import date
+from datetime import date, datetime
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-import barcode
-from barcode.writer import ImageWriter
 
 
 # ---------------------------------------------------------------------------
@@ -100,27 +99,148 @@ def _register_japanese_font():
     return "Helvetica"
 
 
-def _generate_barcode_image(code_str, width_mm=50, height_mm=12):
-    """薬剤コードから CODE128 バーコード画像 (PNG bytes → ReportLab Image) を生成。"""
-    code_str = str(code_str).strip()
-    if not code_str:
-        return None
-    try:
-        CODE128 = barcode.get_barcode_class("code128")
-        writer = ImageWriter()
-        bc = CODE128(code_str, writer=writer)
-        buf = io.BytesIO()
-        bc.write(buf, options={
-            "module_width": 0.25,
-            "module_height": 6.0,
-            "font_size": 7,
-            "text_distance": 2,
-            "quiet_zone": 2,
-        })
-        buf.seek(0)
-        return Image(buf, width=width_mm * mm, height=height_mm * mm)
-    except Exception:
-        return None
+
+# ---------------------------------------------------------------------------
+# 使用量 蓄積・統計管理
+# ---------------------------------------------------------------------------
+
+class UsageHistory:
+    """薬剤ごとの使用予定量を JSON ファイルに蓄積し、統計を計算する。
+
+    保存形式 (usage_history.json):
+    {
+        "<薬剤コード>": {
+            "name": "薬品名",
+            "records": [
+                {"date": "2026-02-19", "quantity": 120.0},
+                ...
+            ]
+        },
+        ...
+    }
+    """
+
+    DEFAULT_FILENAME = "usage_history.json"
+
+    def __init__(self, directory=None):
+        if directory is None:
+            if getattr(sys, "frozen", False):
+                directory = os.path.dirname(sys.executable)
+            else:
+                directory = os.path.dirname(os.path.abspath(__file__))
+        self.filepath = os.path.join(directory, self.DEFAULT_FILENAME)
+        self.data = self._load()
+
+    def _load(self):
+        if not os.path.exists(self.filepath):
+            return {}
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self):
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def add_records(self, schedule_rows, code_key, name_key, qty_key, record_date=None):
+        """使用予定データの行リストを蓄積する。
+        同一日付 + 同一コードの重複は上書き（二重登録防止）。
+        """
+        if record_date is None:
+            record_date = date.today().isoformat()
+
+        for row in schedule_rows:
+            code = str(row.get(code_key, "")).strip()
+            if not code:
+                continue
+            name = str(row.get(name_key, ""))
+            qty = to_number(row.get(qty_key))
+
+            if code not in self.data:
+                self.data[code] = {"name": name, "records": []}
+
+            # 同一日付の既存レコードを探して上書き
+            records = self.data[code]["records"]
+            found = False
+            for rec in records:
+                if rec["date"] == record_date:
+                    rec["quantity"] = qty
+                    found = True
+                    break
+            if not found:
+                records.append({"date": record_date, "quantity": qty})
+
+            # 名前を最新に更新
+            self.data[code]["name"] = name
+
+        self._save()
+
+    def get_statistics(self):
+        """全薬剤の統計サマリーを返す。
+        戻り値: list[dict] — code, name, count, mean, stddev, min, max, latest
+        """
+        result = []
+        for code, info in self.data.items():
+            records = info.get("records", [])
+            if not records:
+                continue
+            quantities = [r["quantity"] for r in records]
+            n = len(quantities)
+            mean = sum(quantities) / n
+            if n >= 2:
+                variance = sum((q - mean) ** 2 for q in quantities) / (n - 1)
+                stddev = math.sqrt(variance)
+            else:
+                stddev = 0.0
+
+            # 最新日付
+            sorted_recs = sorted(records, key=lambda r: r["date"])
+            latest_date = sorted_recs[-1]["date"]
+            latest_qty = sorted_recs[-1]["quantity"]
+
+            result.append({
+                "code": code,
+                "name": info.get("name", ""),
+                "count": n,
+                "mean": mean,
+                "stddev": stddev,
+                "min": min(quantities),
+                "max": max(quantities),
+                "latest_date": latest_date,
+                "latest_qty": latest_qty,
+            })
+        return result
+
+    def get_detail(self, code):
+        """指定コードの全レコードを日付昇順で返す。"""
+        info = self.data.get(code, {})
+        records = info.get("records", [])
+        return sorted(records, key=lambda r: r["date"])
+
+    def delete_record(self, code, record_date):
+        """指定コード・日付のレコードを1件削除する。"""
+        if code in self.data:
+            self.data[code]["records"] = [
+                r for r in self.data[code]["records"] if r["date"] != record_date
+            ]
+            if not self.data[code]["records"]:
+                del self.data[code]
+            self._save()
+
+    def clear_all(self):
+        """全データを削除する。"""
+        self.data = {}
+        self._save()
+
+    def get_record_count(self):
+        """蓄積されている日付数（ユニーク日付の数）を返す。"""
+        dates = set()
+        for info in self.data.values():
+            for r in info.get("records", []):
+                dates.add(r["date"])
+        return len(dates)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +275,12 @@ class App(tk.Tk):
         self.surplus_sort_asc = True
         self.shortage_sort_col = None
         self.shortage_sort_asc = True
+
+        # 使用量蓄積
+        self.usage_history = UsageHistory()
+        self.stats_data = []
+        self.stats_sort_col = None
+        self.stats_sort_asc = True
 
         self._build_ui()
 
@@ -213,6 +339,11 @@ class App(tk.Tk):
         tab2 = ttk.Frame(self.notebook)
         self.notebook.add(tab2, text=" 発注候補リスト ")
         self._build_shortage_tab(tab2)
+
+        # タブ3: 使用量統計
+        tab3 = ttk.Frame(self.notebook)
+        self.notebook.add(tab3, text=" 使用量統計 ")
+        self._build_stats_tab(tab3)
 
         # --- 下部: ステータスバー ---
         self.status_var = tk.StringVar(value="ファイルを選択してください。")
@@ -274,6 +405,208 @@ class App(tk.Tk):
         self.shortage_tree.configure(yscrollcommand=vsb.set)
         self.shortage_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_stats_tab(self, parent):
+        """使用量統計タブの中身を作る。"""
+        # ツールバー
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill=tk.X, padx=5, pady=4)
+
+        ttk.Button(toolbar, text="統計を更新", command=self._refresh_stats).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="選択品目の履歴", command=self._show_detail).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="選択レコード削除", command=self._delete_selected_record).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(toolbar, text="CSVで保存", command=self._save_stats_csv).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(toolbar, text="全データ消去", command=self._clear_all_history).pack(side=tk.RIGHT, padx=2)
+
+        self.stats_info_var = tk.StringVar(value="蓄積データ: 0 日分")
+        ttk.Label(toolbar, textvariable=self.stats_info_var, style="Path.TLabel").pack(side=tk.RIGHT, padx=10)
+
+        # メイン: 上下分割 (PanedWindow)
+        paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+        # 上段: サマリーテーブル
+        top_frame = ttk.LabelFrame(paned, text="品目別サマリー（安全在庫 = 平均 + 1σ）", padding=4)
+        paned.add(top_frame, weight=3)
+
+        cols_s = ("code", "name", "count", "mean", "stddev", "safety",
+                  "min", "max", "latest_date", "latest_qty")
+        hdrs_s = ("コード", "薬品名", "回数", "平均", "標準偏差(σ)",
+                  "安全在庫(平均+1σ)", "最小", "最大", "最新日付", "最新量")
+        widths_s = (90, 250, 50, 80, 80, 100, 70, 70, 90, 80)
+
+        container_s = ttk.Frame(top_frame)
+        container_s.pack(fill=tk.BOTH, expand=True)
+        self.stats_tree = ttk.Treeview(container_s, columns=cols_s, show="headings", selectmode="browse")
+        for c, h, w in zip(cols_s, hdrs_s, widths_s):
+            self.stats_tree.heading(c, text=h, command=lambda _c=c: self._sort_stats_toggle(_c))
+            anchor = tk.E if c not in ("code", "name", "latest_date") else tk.W
+            self.stats_tree.column(c, width=w, anchor=anchor)
+        vsb_s = ttk.Scrollbar(container_s, orient=tk.VERTICAL, command=self.stats_tree.yview)
+        self.stats_tree.configure(yscrollcommand=vsb_s.set)
+        self.stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb_s.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 下段: 詳細テーブル（選択品目の履歴）
+        bottom_frame = ttk.LabelFrame(paned, text="選択品目の使用量履歴", padding=4)
+        paned.add(bottom_frame, weight=2)
+
+        cols_d = ("date", "quantity")
+        hdrs_d = ("日付", "使用予定量")
+        widths_d = (150, 150)
+
+        container_d = ttk.Frame(bottom_frame)
+        container_d.pack(fill=tk.BOTH, expand=True)
+        self.detail_tree = ttk.Treeview(container_d, columns=cols_d, show="headings", selectmode="browse")
+        for c, h, w in zip(cols_d, hdrs_d, widths_d):
+            self.detail_tree.heading(c, text=h)
+            anchor = tk.E if c == "quantity" else tk.W
+            self.detail_tree.column(c, width=w, anchor=anchor)
+        vsb_d = ttk.Scrollbar(container_d, orient=tk.VERTICAL, command=self.detail_tree.yview)
+        self.detail_tree.configure(yscrollcommand=vsb_d.set)
+        self.detail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb_d.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 初期表示
+        self._refresh_stats()
+
+    # ---- 統計タブ: 操作 ----
+    def _refresh_stats(self):
+        """蓄積データから統計を再計算してツリーを更新する。"""
+        self.usage_history = UsageHistory()  # ファイルを再読み込み
+        self.stats_data = self.usage_history.get_statistics()
+        self.stats_info_var.set(f"蓄積データ: {self.usage_history.get_record_count()} 日分")
+        self._refresh_stats_tree()
+
+    def _refresh_stats_tree(self):
+        tree = self.stats_tree
+        tree.delete(*tree.get_children())
+        for r in self.stats_data:
+            safety = r["mean"] + r["stddev"]  # 平均 + 1σ
+            tree.insert("", tk.END, values=(
+                r["code"],
+                r["name"],
+                r["count"],
+                f'{r["mean"]:,.1f}',
+                f'{r["stddev"]:,.1f}',
+                f'{safety:,.1f}',
+                f'{r["min"]:,.1f}',
+                f'{r["max"]:,.1f}',
+                r["latest_date"],
+                f'{r["latest_qty"]:,.1f}',
+            ))
+
+    def _sort_stats_toggle(self, col):
+        if self.stats_sort_col == col:
+            self.stats_sort_asc = not self.stats_sort_asc
+        else:
+            self.stats_sort_col = col
+            self.stats_sort_asc = False
+        key_map = {
+            "code": "code", "name": "name", "count": "count",
+            "mean": "mean", "stddev": "stddev",
+            "safety": None,  # 計算列
+            "min": "min", "max": "max",
+            "latest_date": "latest_date", "latest_qty": "latest_qty",
+        }
+        if col == "safety":
+            self.stats_data.sort(
+                key=lambda r: r["mean"] + r["stddev"],
+                reverse=not self.stats_sort_asc,
+            )
+        else:
+            k = key_map.get(col, col)
+            self.stats_data.sort(
+                key=lambda r: r.get(k, 0),
+                reverse=not self.stats_sort_asc,
+            )
+        self._refresh_stats_tree()
+
+    def _show_detail(self):
+        """選択中の品目の使用量履歴を下段に表示する。"""
+        sel = self.stats_tree.selection()
+        if not sel:
+            messagebox.showinfo("未選択", "上のサマリーから品目を選択してください。")
+            return
+        values = self.stats_tree.item(sel[0], "values")
+        code = values[0]
+        records = self.usage_history.get_detail(code)
+        tree = self.detail_tree
+        tree.delete(*tree.get_children())
+        for rec in records:
+            tree.insert("", tk.END, values=(rec["date"], f'{rec["quantity"]:,.1f}'))
+
+    def _delete_selected_record(self):
+        """下段で選択中の履歴レコードを1件削除する。"""
+        # まずサマリーで選択されたコードを取得
+        sel_s = self.stats_tree.selection()
+        if not sel_s:
+            messagebox.showinfo("未選択", "サマリーから品目を選択してください。")
+            return
+        code = self.stats_tree.item(sel_s[0], "values")[0]
+
+        sel_d = self.detail_tree.selection()
+        if not sel_d:
+            messagebox.showinfo("未選択", "下の履歴から削除するレコードを選択してください。")
+            return
+        vals = self.detail_tree.item(sel_d[0], "values")
+        record_date = vals[0]
+
+        if not messagebox.askyesno("確認", f"{code} の {record_date} のレコードを削除しますか？"):
+            return
+
+        self.usage_history.delete_record(code, record_date)
+        self._refresh_stats()
+        # 詳細も更新
+        remaining = self.usage_history.get_detail(code)
+        self.detail_tree.delete(*self.detail_tree.get_children())
+        for rec in remaining:
+            self.detail_tree.insert("", tk.END, values=(rec["date"], f'{rec["quantity"]:,.1f}'))
+        self.status_var.set(f"レコード削除: {code} / {record_date}")
+
+    def _clear_all_history(self):
+        """全蓄積データを消去する。"""
+        if not messagebox.askyesno("全データ消去", "蓄積した使用量データを全て消去しますか？\nこの操作は取り消せません。"):
+            return
+        self.usage_history.clear_all()
+        self._refresh_stats()
+        self.detail_tree.delete(*self.detail_tree.get_children())
+        self.status_var.set("使用量データを全消去しました。")
+
+    def _save_stats_csv(self):
+        """統計サマリーを CSV で保存する。"""
+        if not self.stats_data:
+            messagebox.showinfo("データなし", "統計データがありません。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="統計CSVを保存",
+            defaultextension=".csv",
+            initialfile="使用量統計.csv",
+            filetypes=[("CSV ファイル", "*.csv")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "コード", "薬品名", "記録回数", "平均", "標準偏差(σ)",
+                    "安全在庫(平均+1σ)", "最小", "最大", "最新日付", "最新量",
+                ])
+                for r in self.stats_data:
+                    safety = r["mean"] + r["stddev"]
+                    writer.writerow([
+                        r["code"], r["name"], r["count"],
+                        f'{r["mean"]:.1f}', f'{r["stddev"]:.1f}',
+                        f'{safety:.1f}',
+                        f'{r["min"]:.1f}', f'{r["max"]:.1f}',
+                        r["latest_date"], f'{r["latest_qty"]:.1f}',
+                    ])
+            self.status_var.set(f"統計CSV保存完了: {os.path.basename(path)}")
+            messagebox.showinfo("保存完了", f"ファイルを保存しました。\n{path}")
+        except Exception as e:
+            messagebox.showerror("保存エラー", f"保存に失敗しました。\n{e}")
 
     # ---- ファイル選択 ----
     def _select_inventory(self):
@@ -420,6 +753,12 @@ class App(tk.Tk):
 
         self._refresh_surplus_tree()
         self._refresh_shortage_tree()
+
+        # 使用予定データを蓄積
+        self.usage_history.add_records(
+            sch_rows, code_key=sch_key, name_key="薬剤名", qty_key="使用予定量"
+        )
+        self._refresh_stats()
 
         total_surplus = len(surplus_list)
         total_shortage = len(shortage_list)
@@ -595,27 +934,24 @@ class App(tk.Tk):
         # テーブルデータ構築
         header_row = [
             Paragraph("日付", style_header),
+            Paragraph("コード", style_header),
             Paragraph("医薬品名", style_header),
             Paragraph("発注必要数", style_header),
-            Paragraph("バーコード", style_header),
         ]
         table_data = [header_row]
 
         for r in self.shortage_data:
-            bc_img = _generate_barcode_image(r["code"], width_mm=40, height_mm=10)
-            bc_cell = bc_img if bc_img else Paragraph(str(r["code"]), style_normal)
-
             row = [
                 Paragraph(today_str, style_normal),
+                Paragraph(str(r["code"]), style_normal),
                 Paragraph(str(r["name"]), style_normal),
                 Paragraph(f'{r["shortage"]:,.1f}', style_normal),
-                bc_cell,
             ]
             table_data.append(row)
 
         # カラム幅
         page_w = A4[0] - 30 * mm  # 左右マージン除外
-        col_widths = [28 * mm, page_w - 28 * mm - 25 * mm - 45 * mm, 25 * mm, 45 * mm]
+        col_widths = [28 * mm, 30 * mm, page_w - 28 * mm - 30 * mm - 25 * mm, 25 * mm]
 
         table = Table(table_data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([
@@ -632,7 +968,7 @@ class App(tk.Tk):
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             # 位置
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (2, 0), (2, -1), "RIGHT"),
+            ("ALIGN", (3, 0), (3, -1), "RIGHT"),
             ("TOPPADDING", (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ("LEFTPADDING", (0, 0), (-1, -1), 4),
