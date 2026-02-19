@@ -21,10 +21,10 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name "薬剤在庫管理" app.py
+        run: pyinstaller --onefile --windowed --name "yakuzai-zaiko" app.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 薬剤在庫管理-exe
-          path: dist/薬剤在庫管理.exe
+          name: yakuzai-zaiko-exe
+          path: dist/yakuzai-zaiko.exe
