@@ -9,6 +9,21 @@ from tkinter import ttk, filedialog, messagebox
 import csv
 import os
 import sys
+import io
+from datetime import date
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+import barcode
+from barcode.writer import ImageWriter
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +70,57 @@ def to_number(value):
         return float(s)
     except ValueError:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# PDF 用フォント登録
+# ---------------------------------------------------------------------------
+
+def _register_japanese_font():
+    """Windows 環境の日本語フォントを探して登録する。"""
+    candidates = [
+        # Windows
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "msgothic.ttc"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "meiryo.ttc"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "YuGothM.ttc"),
+        # macOS (開発用)
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Supplemental/Osaka.ttf",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont("JaFont", path))
+                return "JaFont"
+            except Exception:
+                continue
+    # フォールバック: Helvetica（日本語は文字化けする可能性あり）
+    return "Helvetica"
+
+
+def _generate_barcode_image(code_str, width_mm=50, height_mm=12):
+    """薬剤コードから CODE128 バーコード画像 (PNG bytes → ReportLab Image) を生成。"""
+    code_str = str(code_str).strip()
+    if not code_str:
+        return None
+    try:
+        CODE128 = barcode.get_barcode_class("code128")
+        writer = ImageWriter()
+        bc = CODE128(code_str, writer=writer)
+        buf = io.BytesIO()
+        bc.write(buf, options={
+            "module_width": 0.25,
+            "module_height": 6.0,
+            "font_size": 7,
+            "text_distance": 2,
+            "quiet_zone": 2,
+        })
+        buf.seek(0)
+        return Image(buf, width=width_mm * mm, height=height_mm * mm)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +260,7 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="金額 高い順", command=lambda: self._sort_shortage("cost", False)).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="数量 多い順", command=lambda: self._sort_shortage("shortage", False)).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="CSVで保存", command=lambda: self._save_csv("shortage")).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(toolbar, text="発注PDFで保存", command=self._save_order_pdf).pack(side=tk.RIGHT, padx=2)
 
         container = ttk.Frame(parent)
         container.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
@@ -459,6 +526,131 @@ class App(tk.Tk):
             messagebox.showinfo("保存完了", f"ファイルを保存しました。\n{path}")
         except Exception as e:
             messagebox.showerror("保存エラー", f"ファイルの保存に失敗しました。\n{e}")
+
+    # ---- 発注 PDF 保存 ----
+    def _save_order_pdf(self):
+        if not self.shortage_data:
+            messagebox.showinfo("データなし", "保存するデータがありません。先に計算を実行してください。")
+            return
+
+        today_str = date.today().strftime("%Y%m%d")
+        default_name = f"発注リスト_{today_str}.pdf"
+        path = filedialog.asksaveasfilename(
+            title="発注PDFを保存",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF ファイル", "*.pdf")],
+        )
+        if not path:
+            return
+
+        try:
+            self._build_order_pdf(path)
+            self.status_var.set(f"PDF保存完了: {os.path.basename(path)}")
+            messagebox.showinfo("保存完了", f"発注PDFを保存しました。\n{path}")
+        except Exception as e:
+            messagebox.showerror("PDF保存エラー", f"PDFの作成に失敗しました。\n{e}")
+
+    def _build_order_pdf(self, filepath):
+        """発注候補データから PDF を生成する。"""
+        font_name = _register_japanese_font()
+        today_str = date.today().strftime("%Y年%m月%d日")
+
+        doc = SimpleDocTemplate(
+            filepath,
+            pagesize=A4,
+            leftMargin=15 * mm,
+            rightMargin=15 * mm,
+            topMargin=15 * mm,
+            bottomMargin=15 * mm,
+        )
+
+        styles = getSampleStyleSheet()
+        style_title = ParagraphStyle(
+            "TitleJa", parent=styles["Title"],
+            fontName=font_name, fontSize=16, leading=22,
+        )
+        style_normal = ParagraphStyle(
+            "NormalJa", parent=styles["Normal"],
+            fontName=font_name, fontSize=9, leading=12,
+        )
+        style_header = ParagraphStyle(
+            "HeaderJa", parent=styles["Normal"],
+            fontName=font_name, fontSize=9, leading=12,
+            textColor=colors.white,
+        )
+        style_date = ParagraphStyle(
+            "DateJa", parent=styles["Normal"],
+            fontName=font_name, fontSize=10, leading=14,
+        )
+
+        elements = []
+
+        # タイトル
+        elements.append(Paragraph("発注リスト", style_title))
+        elements.append(Spacer(1, 2 * mm))
+        elements.append(Paragraph(f"作成日: {today_str}", style_date))
+        elements.append(Spacer(1, 6 * mm))
+
+        # テーブルデータ構築
+        header_row = [
+            Paragraph("日付", style_header),
+            Paragraph("医薬品名", style_header),
+            Paragraph("発注必要数", style_header),
+            Paragraph("バーコード", style_header),
+        ]
+        table_data = [header_row]
+
+        for r in self.shortage_data:
+            bc_img = _generate_barcode_image(r["code"], width_mm=40, height_mm=10)
+            bc_cell = bc_img if bc_img else Paragraph(str(r["code"]), style_normal)
+
+            row = [
+                Paragraph(today_str, style_normal),
+                Paragraph(str(r["name"]), style_normal),
+                Paragraph(f'{r["shortage"]:,.1f}', style_normal),
+                bc_cell,
+            ]
+            table_data.append(row)
+
+        # カラム幅
+        page_w = A4[0] - 30 * mm  # 左右マージン除外
+        col_widths = [28 * mm, page_w - 28 * mm - 25 * mm - 45 * mm, 25 * mm, 45 * mm]
+
+        table = Table(table_data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(TableStyle([
+            # ヘッダー
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3a3a3a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), font_name),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            # データ行
+            ("FONTNAME", (0, 1), (-1, -1), font_name),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+            # 枠線
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            # 位置
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (2, 0), (2, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+
+        elements.append(table)
+
+        # 合計行
+        total_items = len(self.shortage_data)
+        total_cost = sum(r["cost"] for r in self.shortage_data)
+        elements.append(Spacer(1, 4 * mm))
+        elements.append(Paragraph(
+            f"合計 {total_items} 品目 / 概算合計金額: ¥{total_cost:,.0f}",
+            style_date,
+        ))
+
+        doc.build(elements)
 
 
 # ---------------------------------------------------------------------------
