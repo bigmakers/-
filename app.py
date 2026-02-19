@@ -242,6 +242,85 @@ class UsageHistory:
                 dates.add(r["date"])
         return len(dates)
 
+    def import_from_csv(self, filepath):
+        """エクスポートした統計CSVまたは履歴CSVを読み込んで蓄積データに統合する。
+
+        対応フォーマット:
+          A) 統計サマリーCSV — カラム: コード, 薬品名, ... (最新日付, 最新量を1レコードとして取り込む)
+          B) 履歴CSV — カラム: コード, 薬品名, 日付, 使用予定量
+        """
+        headers, rows = read_csv_auto_encoding(filepath, skiprows=0)
+
+        imported = 0
+
+        # フォーマットB: 履歴CSV（「日付」カラムがある場合）
+        if "日付" in headers and "使用予定量" in headers and "コード" in headers:
+            for row in rows:
+                code = str(row.get("コード", "")).strip()
+                if not code:
+                    continue
+                name = str(row.get("薬品名", ""))
+                qty = to_number(row.get("使用予定量"))
+                rec_date = str(row.get("日付", "")).strip()
+                if not rec_date:
+                    continue
+
+                if code not in self.data:
+                    self.data[code] = {"name": name, "records": []}
+
+                records = self.data[code]["records"]
+                found = False
+                for rec in records:
+                    if rec["date"] == rec_date:
+                        rec["quantity"] = qty
+                        found = True
+                        break
+                if not found:
+                    records.append({"date": rec_date, "quantity": qty})
+
+                if name:
+                    self.data[code]["name"] = name
+                imported += 1
+
+        # フォーマットA: 統計サマリーCSV（「最新日付」「最新量」カラムがある場合）
+        elif "最新日付" in headers and "最新量" in headers and "コード" in headers:
+            for row in rows:
+                code = str(row.get("コード", "")).strip()
+                if not code:
+                    continue
+                name = str(row.get("薬品名", ""))
+                qty = to_number(row.get("最新量"))
+                rec_date = str(row.get("最新日付", "")).strip()
+                if not rec_date:
+                    continue
+
+                if code not in self.data:
+                    self.data[code] = {"name": name, "records": []}
+
+                records = self.data[code]["records"]
+                found = False
+                for rec in records:
+                    if rec["date"] == rec_date:
+                        rec["quantity"] = qty
+                        found = True
+                        break
+                if not found:
+                    records.append({"date": rec_date, "quantity": qty})
+
+                if name:
+                    self.data[code]["name"] = name
+                imported += 1
+        else:
+            raise ValueError(
+                "CSVフォーマットが認識できません。\n"
+                "必要なカラム:\n"
+                "  履歴CSV: コード, 薬品名, 日付, 使用予定量\n"
+                "  統計CSV: コード, 薬品名, ..., 最新日付, 最新量"
+            )
+
+        self._save()
+        return imported
+
 
 # ---------------------------------------------------------------------------
 # メイン GUI
@@ -381,9 +460,11 @@ class App(tk.Tk):
 
     def _build_shortage_tab(self, parent):
         """発注候補タブの中身を作る。"""
-        cols = ("code", "name", "unit", "stock", "scheduled", "shortage", "price", "cost")
-        hdrs = ("コード", "薬品名", "単位", "在庫数", "使用予定量", "発注必要数", "薬価", "概算金額")
-        widths = (100, 280, 60, 90, 90, 90, 100, 110)
+        cols = ("code", "name", "unit", "stock", "scheduled", "shortage",
+                "safety", "price", "cost")
+        hdrs = ("コード", "薬品名", "単位", "在庫数", "使用予定量", "発注必要数",
+                "安全在庫", "薬価", "概算金額")
+        widths = (90, 240, 50, 80, 80, 80, 80, 90, 100)
 
         toolbar = ttk.Frame(parent)
         toolbar.pack(fill=tk.X, padx=5, pady=4)
@@ -399,7 +480,7 @@ class App(tk.Tk):
         self.shortage_tree = ttk.Treeview(container, columns=cols, show="headings", selectmode="browse")
         for c, h, w in zip(cols, hdrs, widths):
             self.shortage_tree.heading(c, text=h, command=lambda _c=c: self._sort_shortage_toggle(_c))
-            anchor = tk.E if c in ("stock", "scheduled", "shortage", "price", "cost") else tk.W
+            anchor = tk.E if c in ("stock", "scheduled", "shortage", "safety", "price", "cost") else tk.W
             self.shortage_tree.column(c, width=w, anchor=anchor)
         vsb = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.shortage_tree.yview)
         self.shortage_tree.configure(yscrollcommand=vsb.set)
@@ -417,6 +498,7 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="選択レコード削除", command=self._delete_selected_record).pack(side=tk.LEFT, padx=2)
 
         ttk.Button(toolbar, text="CSVで保存", command=self._save_stats_csv).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(toolbar, text="CSVインポート", command=self._import_stats_csv).pack(side=tk.RIGHT, padx=2)
         ttk.Button(toolbar, text="全データ消去", command=self._clear_all_history).pack(side=tk.RIGHT, padx=2)
 
         self.stats_info_var = tk.StringVar(value="蓄積データ: 0 日分")
@@ -608,6 +690,29 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("保存エラー", f"保存に失敗しました。\n{e}")
 
+    def _import_stats_csv(self):
+        """統計CSV または 履歴CSV をインポートして蓄積データに統合する。"""
+        path = filedialog.askopenfilename(
+            title="インポートするCSVを選択",
+            filetypes=[("CSV ファイル", "*.csv"), ("すべてのファイル", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            imported = self.usage_history.import_from_csv(path)
+            self._refresh_stats()
+            self.status_var.set(f"CSVインポート完了: {imported} 件取り込み ({os.path.basename(path)})")
+            messagebox.showinfo(
+                "インポート完了",
+                f"{imported} 件のレコードを取り込みました。\n{os.path.basename(path)}"
+            )
+        except ValueError as e:
+            messagebox.showerror("フォーマットエラー", str(e))
+        except UnicodeDecodeError:
+            messagebox.showerror("読み込みエラー", "CSVファイルの文字コードを判定できませんでした。")
+        except Exception as e:
+            messagebox.showerror("インポートエラー", f"CSVの読み込みに失敗しました。\n{e}")
+
     # ---- ファイル選択 ----
     def _select_inventory(self):
         path = filedialog.askopenfilename(
@@ -696,6 +801,11 @@ class App(tk.Tk):
             if code:
                 sch_dict[code] = row
 
+        # 安全在庫辞書を構築 {コード: 平均+1σ}
+        safety_dict = {}
+        for stat in self.usage_history.get_statistics():
+            safety_dict[stat["code"]] = stat["mean"] + stat["stddev"]
+
         # マージ対象: 両方に存在するコード + 片方だけのコード
         all_codes = set(inv_dict.keys()) | set(sch_dict.keys())
 
@@ -709,6 +819,7 @@ class App(tk.Tk):
             stock = to_number(inv_row.get("在庫数")) if inv_row else 0.0
             scheduled = to_number(sch_row.get("使用予定量")) if sch_row else 0.0
             price = to_number(sch_row.get("薬価")) if sch_row else 0.0
+            safety = safety_dict.get(code, 0.0)
 
             name = ""
             unit = ""
@@ -740,6 +851,7 @@ class App(tk.Tk):
                     "stock": stock,
                     "scheduled": scheduled,
                     "shortage": shortage_val,
+                    "safety": safety,
                     "price": price,
                     "cost": shortage_val * price,
                 })
@@ -793,6 +905,8 @@ class App(tk.Tk):
         tree = self.shortage_tree
         tree.delete(*tree.get_children())
         for r in self.shortage_data:
+            safety = r.get("safety", 0.0)
+            safety_str = f'{safety:,.1f}' if safety > 0 else "-"
             tree.insert("", tk.END, values=(
                 r["code"],
                 r["name"],
@@ -800,6 +914,7 @@ class App(tk.Tk):
                 f'{r["stock"]:,.1f}',
                 f'{r["scheduled"]:,.1f}',
                 f'{r["shortage"]:,.1f}',
+                safety_str,
                 f'{r["price"]:,.2f}',
                 f'{r["cost"]:,.0f}',
             ))
@@ -838,8 +953,8 @@ class App(tk.Tk):
             default_name = "返品候補リスト.csv"
         else:
             data = self.shortage_data
-            columns = ["code", "name", "unit", "stock", "scheduled", "shortage", "price", "cost"]
-            headers = ["コード", "薬品名", "単位", "在庫数", "使用予定量", "発注必要数", "薬価", "概算金額"]
+            columns = ["code", "name", "unit", "stock", "scheduled", "shortage", "safety", "price", "cost"]
+            headers = ["コード", "薬品名", "単位", "在庫数", "使用予定量", "発注必要数", "安全在庫", "薬価", "概算金額"]
             default_name = "発注候補リスト.csv"
 
         if not data:
@@ -937,21 +1052,25 @@ class App(tk.Tk):
             Paragraph("コード", style_header),
             Paragraph("医薬品名", style_header),
             Paragraph("発注必要数", style_header),
+            Paragraph("安全在庫", style_header),
         ]
         table_data = [header_row]
 
         for r in self.shortage_data:
+            safety = r.get("safety", 0.0)
+            safety_str = f'{safety:,.1f}' if safety > 0 else "-"
             row = [
                 Paragraph(today_str, style_normal),
                 Paragraph(str(r["code"]), style_normal),
                 Paragraph(str(r["name"]), style_normal),
                 Paragraph(f'{r["shortage"]:,.1f}', style_normal),
+                Paragraph(safety_str, style_normal),
             ]
             table_data.append(row)
 
         # カラム幅
         page_w = A4[0] - 30 * mm  # 左右マージン除外
-        col_widths = [28 * mm, 30 * mm, page_w - 28 * mm - 30 * mm - 25 * mm, 25 * mm]
+        col_widths = [26 * mm, 28 * mm, page_w - 26 * mm - 28 * mm - 24 * mm - 24 * mm, 24 * mm, 24 * mm]
 
         table = Table(table_data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([
@@ -968,7 +1087,7 @@ class App(tk.Tk):
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             # 位置
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+            ("ALIGN", (3, 0), (4, -1), "RIGHT"),
             ("TOPPADDING", (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ("LEFTPADDING", (0, 0), (-1, -1), 4),
